@@ -220,21 +220,122 @@ def nrs_all_pairs(fname, min_overlap_frames=10, progress_bar=False):
     return df_out
 
 
-def nrs_screen(fname, start_slop=0.1, end_slop=0.2):
-    pass
+def _nrs_score(nrs_vals, high_thresh=0.9, n_frames_start=5, min_len=20):
+    """
+    Score the NRS curve
+    """
 
+    if min_len < n_frames_start:
+        raise RuntimeError('Must have `n_frames_start <= min_len.')
+
+    if len(nrs_vals) < min_len:
+        return np.nan, np.nan, np.nan
+
+    # Initial mean
+    initial_mean = np.mean(nrs_vals[:n_frames_start])
+
+    # Find where crosses threshold
+    ind = np.argmax(nrs_vals > high_thresh)
+
+    # Compute average value after crossing threshold
+    if ind == 0 and nrs_vals[0] < high_thresh:
+            plateau_mean = np.nan
+            plateau_mean_dev = np.nan
+    else:
+        plateau_mean = np.mean(nrs_vals[ind:])
+        plateau_mean_dev = np.mean(np.abs(1 - nrs_vals[ind:]))
+
+    return initial_mean, plateau_mean, plateau_mean_dev
+
+
+def nrs_score_tracks(df, high_thresh=0.9, n_frames_start=5, min_len=20):
+    """
+    End value is average over all points after crossing a threshold
+    """
+    
+    cols = ['particle_1', 'particle_2', 'track_len',
+            'initial_mean_x', 'plateau_mean_x', 'plateau_mean_dev_x',
+            'initial_mean_y', 'plateau_mean_y', 'plateau_mean_dev_y']
+    df_out = pd.DataFrame(columns=cols)
+
+    for p, g in df.groupby(['particle_1', 'particle_2']):
+        initial_mean_x, plateau_mean_x, plateau_mean_dev_x = _nrs_score(
+                        g['nrs_x'].values, 
+                        high_thresh=high_thresh,
+                        n_frames_start=n_frames_start, 
+                        min_len=20)
+        initial_mean_y, plateau_mean_y, plateau_mean_dev_y = _nrs_score(
+                        g['nrs_y'].values, 
+                        high_thresh=high_thresh,
+                        n_frames_start=n_frames_start, 
+                        min_len=20)
+        df_out = df_out.append({'particle_1': p[0],
+                                'particle_2': p[1],
+                                'track_len': len(g),
+                                'initial_mean_x': initial_mean_x,
+                                'plateau_mean_x': plateau_mean_x,
+                                'plateau_mean_dev_x': plateau_mean_dev_x,
+                                'initial_mean_y': initial_mean_y,
+                                'plateau_mean_y': plateau_mean_y,
+                                'plateau_mean_dev_y': plateau_mean_dev_y},
+                              ignore_index=True)
+
+    df_out['particle_1'] = df_out['particle_1'].astype(int)
+    df_out['particle_2'] = df_out['particle_2'].astype(int)
+    df_out['track_len'] = df_out['track_len'].astype(int)
+
+    return df_out
+
+
+def nrs_screen(df, low_mean_tol=0.1, high_mean_tol=0.1, high_dev_tol=0.1,
+               min_len=20):
+    """
+    End value is average over all points after crossing a threshold
+    """
+    # Only tracks without NaNs.
+    df = df.dropna(how='any')
+
+    # Set up filter
+    i_initial_x = np.abs(df['initial_mean_x']) <= low_mean_tol
+    i_initial_y = np.abs(df['initial_mean_y']) <= low_mean_tol
+    i_plateau_x = np.abs(1 - df['plateau_mean_x']) <= high_mean_tol
+    i_plateau_y = np.abs(1 - df['plateau_mean_y']) <= high_mean_tol
+    i_dev_x = df['plateau_mean_dev_x'] <= high_dev_tol
+    i_dev_y = df['plateau_mean_dev_y'] <= high_dev_tol
+    i_len = df['track_len'] >= min_len
+
+    inds = (   i_initial_x & i_initial_y
+             & i_plateau_x & i_plateau_y
+             & i_dev_x & i_dev_y
+             & i_len)
+
+    return df.loc[inds, :]
 
 
 if __name__ == '__main__':
-    direc = 'tracking_results'
+    direc = '/Users/Justin/git/misc/microrheo/experimental_data_processing/tracking_results'
     subdirs = ['stage10b', 'stage9', 'stage11', 'stage10a']
     dirs = [os.path.join(direc, subdir) for subdir in subdirs]
 
     def nrs_direc(direc):
         fnames = glob.glob(os.path.join(direc, '*_tracks.csv'))
         for i, fname in enumerate(fnames):
-            print(direc, ',', i+1, ' out of ', len(fnames))
-            _ = nrs_all_pairs(fname, progress_bar=False)
+            out_name = fname[:fname.rfind('_')] + '_nrs.csv'
+            print(direc[direc.rfind('/')+1:], i+1, 'out of', len(fnames))
+            if not os.path.isfile(out_name):
+                _ = nrs_all_pairs(fname, progress_bar=False)
+
+            score_name = fname[:fname.rfind('_')] + '_nrs_score.csv'
+            if not os.path.isfile(score_name):
+                df = pd.read_csv(out_name)
+                df_score = nrs_score_tracks(df, high_thresh=0.9, 
+                                            n_frames_start=5, min_len=100)
+                df_score.to_csv(fname[:fname.rfind('_')] + '_nrs_score.csv')
+            df_score = pd.read_csv(score_name)
+            df_screen = nrs_screen(df_score, low_mean_tol=0.1,
+                             high_mean_tol=0.2, high_dev_tol=0.2, min_len=100)
+            df_screen.to_csv(fname[:fname.rfind('_')] + '_nrs_screen.csv')
+
 
     # Processes the directories in parallel
     joblib.Parallel(n_jobs=4)(
